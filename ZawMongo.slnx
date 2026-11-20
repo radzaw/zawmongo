@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ZawMongo/ZawMongo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ZawMongo.Tests/ZawMongo.Tests.csproj" />
+  </Folder>
+</Solution>

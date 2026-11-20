@@ -1,0 +1,129 @@
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.Extensions.FileProviders;
+
+namespace ZawMongo;
+
+/// <summary>Builds the ZawMongo web host. Shared by the executable and the test suite.</summary>
+public static class AppHost
+{
+    public static WebApplication Build(AppOptions opts)
+    {
+        // Saved sessions and their key live here: other users of the machine get no access (when it is created).
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(opts.ConfigDir);
+        else Directory.CreateDirectory(opts.ConfigDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions { ContentRootPath = AppContext.BaseDirectory });
+        builder.Logging.ClearProviders();
+        builder.Logging.AddSimpleConsole(o => o.SingleLine = true);
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        builder.WebHost.ConfigureKestrel(k =>
+        {
+            // Loopback only: the backend must never be reachable from the network.
+            k.Listen(IPAddress.Loopback, opts.Port);
+            k.Limits.MaxRequestBodySize = 256L * 1024 * 1024;
+        });
+        builder.Services.AddSingleton(opts);
+        builder.Services.AddSingleton<BootCodes>();
+        builder.Services.AddSingleton<SessionStore>();
+        builder.Services.AddSingleton<ConnectionManager>();
+        builder.Services.AddSingleton<Heartbeat>();
+        builder.Services.AddSingleton<AppWindow>();
+        builder.Services.AddSingleton<ImportStore>();
+        builder.Services.AddSingleton<Updater>();
+
+        var app = builder.Build();
+
+        // Every API call must carry the per-process token, so other local web pages can't drive the backend.
+        var tokenBytes = Encoding.ASCII.GetBytes(opts.Token);
+        app.Use(async (ctx, next) =>
+        {
+            if (ctx.Request.Path.StartsWithSegments("/api"))
+            {
+                var supplied = ctx.Request.Headers["X-Token"].FirstOrDefault() ?? ctx.Request.Query["token"].FirstOrDefault() ?? "";
+                if (!CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(supplied), tokenBytes))
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    return;
+                }
+            }
+            await next();
+        });
+
+        var files = new ManifestEmbeddedFileProvider(typeof(AppHost).Assembly, "wwwroot");
+        app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = files });
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = files,
+            OnPrepareResponse = c => c.Context.Response.Headers.CacheControl = "no-cache",
+        });
+
+        Api.Map(app);
+        // Outside /api: the page has no token yet. It trades the one-time code of its URL for it.
+        app.MapPost("/boot", (HttpRequest r, BootCodes codes) => codes.Redeem(r.Headers["X-Boot"].FirstOrDefault()) is { } t
+            ? Results.Json(new { token = t }) : Results.StatusCode(StatusCodes.Status401Unauthorized));
+        app.Lifetime.ApplicationStopped.Register(() =>
+        {
+            app.Services.GetRequiredService<ImportStore>().DisposeAsync().AsTask().Wait();
+            app.Services.GetRequiredService<ConnectionManager>().DisposeAsync().AsTask().Wait();
+        });
+        return app;
+    }
+
+    /// <summary>Base address (http://127.0.0.1:port) of a started host.</summary>
+    public static string Address(WebApplication app) =>
+        app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
+
+    /// <summary>
+    /// The URL that opens the UI: token, plus the saved theme so the page paints in the right colors at once.
+    /// <paramref name="oneTime"/>: a one-time code in place of the token, for a URL that goes on a browser's command
+    /// line, which other users of the machine can read (ps, /proc).
+    /// </summary>
+    public static string LaunchUrl(WebApplication app, AppOptions opts, bool oneTime = false)
+    {
+        var url = oneTime ? $"{Address(app)}/#boot={app.Services.GetRequiredService<BootCodes>().Issue()}" : $"{Address(app)}/#token={opts.Token}";
+        var state = app.Services.GetRequiredService<SessionStore>().LoadState();
+        if (state.ValueKind == JsonValueKind.Object && state.TryGetProperty("prefs", out var prefs) && prefs.ValueKind == JsonValueKind.Object
+            && prefs.TryGetProperty("theme", out var theme) && theme.GetString() is "light" or "dark" or "system")
+            url += $"&theme={theme.GetString()}";
+        return url;
+    }
+
+    /// <summary>The saved interface zoom in percent (prefs.uiZoom); 100 when unset or out of range.</summary>
+    public static int SavedZoom(WebApplication app)
+    {
+        var state = app.Services.GetRequiredService<SessionStore>().LoadState();
+        return state.ValueKind == JsonValueKind.Object && state.TryGetProperty("prefs", out var prefs) && prefs.ValueKind == JsonValueKind.Object
+            && prefs.TryGetProperty("uiZoom", out var zoom) && zoom.ValueKind == JsonValueKind.Number && zoom.TryGetInt32(out var z)
+            && z is >= AppWindow.MinZoom and <= AppWindow.MaxZoom
+            ? z : 100;
+    }
+}
+
+/// <summary>One-time codes that open a window: each gives out the API token once, within a few minutes.</summary>
+public sealed class BootCodes(AppOptions opts)
+{
+    static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(5);
+    readonly Dictionary<string, DateTime> codes = [];
+
+    public string Issue()
+    {
+        var code = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        lock (codes) codes[code] = DateTime.UtcNow + Lifetime;
+        return code;
+    }
+
+    /// <summary>The token for a valid, unused code (which is then used up); null otherwise.</summary>
+    public string? Redeem(string? code)
+    {
+        if (string.IsNullOrEmpty(code)) return null;
+        lock (codes)
+        {
+            codes.Where(c => c.Value < DateTime.UtcNow).Select(c => c.Key).ToList().ForEach(k => codes.Remove(k));
+            return codes.Remove(code) ? opts.Token : null;
+        }
+    }
+}

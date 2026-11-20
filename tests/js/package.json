@@ -1,0 +1,12 @@
+{
+  "name": "zawmongo-js-tests",
+  "private": true,
+  "type": "module",
+  "description": "Unit tests for the ZawMongo UI modules that need no DOM (Node's built-in test runner, no dependencies).",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

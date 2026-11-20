@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build & unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build
+        run: dotnet build ZawMongo.slnx -c Release
+      - name: Unit tests (integration tests skip without a database)
+        run: dotnet test ZawMongo.slnx -c Release --no-build --logger "trx;LogFileName=unit.trx" --results-directory TestResults
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-tests-${{ matrix.os }}
+          path: TestResults
+
+  js:
+    name: UI unit tests (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run node:test suites
+        working-directory: tests/js
+        run: npm test
+
+  integration:
+    name: Integration tests (MongoDB ${{ matrix.mongo }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mongo: ['7.0', '8.0']
+    services:
+      mongo:
+        image: mongo:${{ matrix.mongo }}
+        ports: ['27017:27017']
+    env:
+      ZAWMONGO_TEST_URI: mongodb://127.0.0.1:27017/?directConnection=true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Integration tests
+        run: dotnet test ZawMongo.slnx -c Release --filter "FullyQualifiedName~Integration"
+
+  package:
+    name: Package (${{ matrix.rid }})
+    needs: [build, js, integration]
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # The Windows build runs on Windows: only there does the SDK embed the icon (and version info) into the .exe.
+        include:
+          - { rid: win-x64, os: windows-latest }
+          - { rid: linux-x64, os: ubuntu-latest }
+          - { rid: linux-arm64, os: ubuntu-latest }
+          - { rid: osx-x64, os: ubuntu-latest }
+          - { rid: osx-arm64, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish single-file build
+        # A vX.Y.Z tag stamps the build with that version (what the self-updater compares).
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          sh ./publish.sh ${{ matrix.rid }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zawmongo-${{ matrix.rid }}
+          path: dist/${{ matrix.rid }}
+
+  sign:
+    # Signs ZawMongo.exe with Azure Artifact Signing (formerly Trusted Signing) before the release is assembled,
+    # so SHA256SUMS covers the signed file. Without the AZURE_SIGNING_* variables the release goes out unsigned.
+    name: Sign Windows build
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zawmongo-win-x64
+          path: dist/win-x64
+      - name: Signing not configured
+        if: vars.AZURE_SIGNING_ACCOUNT == ''
+        run: echo "::warning::AZURE_SIGNING_ACCOUNT is not set; the Windows build is released unsigned."
+      - uses: azure/login@v3
+        if: vars.AZURE_SIGNING_ACCOUNT != ''
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/artifact-signing-action@v2
+        if: vars.AZURE_SIGNING_ACCOUNT != ''
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\win-x64
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: ZawMongo
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+      - name: Check the signature and that the signed build starts
+        if: vars.AZURE_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        run: |
+          $exe = 'dist/win-x64/ZawMongo.exe'
+          $sig = Get-AuthenticodeSignature $exe
+          "$($sig.Status): $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "ZawMongo.exe is not validly signed: $($sig.StatusMessage)" }
+          $p = Start-Process $exe -PassThru -ArgumentList '--no-browser', '--port', '5399', '--token', 'smoke-token-0123456789abcdef', '--config', "$env:RUNNER_TEMP\zawmongo-cfg"
+          $up = $false
+          for ($i = 0; $i -lt 60 -and -not $up; $i++) {
+            try { $up = (Invoke-WebRequest http://127.0.0.1:5399/ -UseBasicParsing).StatusCode -eq 200 } catch { Start-Sleep -Milliseconds 500 }
+          }
+          Stop-Process $p -Force
+          if (-not $up) { throw 'The signed ZawMongo.exe did not start.' }
+      - uses: actions/upload-artifact@v4
+        if: vars.AZURE_SIGNING_ACCOUNT != ''
+        with:
+          name: zawmongo-win-x64
+          path: dist/win-x64
+          overwrite: true
+
+  release:
+    name: GitHub release
+    needs: [package, sign]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zawmongo-*
+          path: artifacts
+      - name: Name the assets the way the self-updater expects
+        # zawmongo-<rid>[.exe] plus SHA256SUMS; ZawMongo refuses a download whose checksum doesn't match.
+        run: |
+          mkdir release
+          for d in artifacts/zawmongo-*; do
+            rid="${d#artifacts/zawmongo-}"
+            if [ -f "$d/ZawMongo.exe" ]; then cp "$d/ZawMongo.exe" "release/zawmongo-$rid.exe"
+            else cp "$d/ZawMongo" "release/zawmongo-$rid"; chmod +x "release/zawmongo-$rid"; fi
+          done
+          (cd release && sha256sum zawmongo-* > SHA256SUMS && cat SHA256SUMS)
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "ZawMongo ${GITHUB_REF_NAME#v}" --generate-notes $flags

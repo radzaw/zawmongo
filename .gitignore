@@ -1,0 +1,8 @@
+bin/
+obj/
+dist/
+.vs/
+.vscode/
+*.user
+TestResults/
+tests/js/node_modules/
